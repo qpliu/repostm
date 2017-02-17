@@ -1,22 +1,11 @@
 package repostm
 
 import (
+	"bytes"
 	"sync"
 	"testing"
 	"time"
 )
-
-func equal(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
 
 func Test1(t *testing.T) {
 	repo := New()
@@ -26,8 +15,8 @@ func Test1(t *testing.T) {
 	f := func(n byte, count int) {
 		defer wg.Done()
 		for i := 0; i < count; i++ {
-			err := h.Atomically(func(bytes []byte) ([]byte, error) {
-				return append(bytes, n), nil
+			err := h.Atomically(func(value interface{}) (interface{}, error) {
+				return append(value.([]byte), n), nil
 			})
 			if err != nil {
 				t.Errorf("Atomically: %s", err)
@@ -40,10 +29,10 @@ func Test1(t *testing.T) {
 	go f(2, 50)
 	wg.Wait()
 	counts := []byte{0, 0, 0}
-	for _, b := range h.Checkout().Bytes {
+	for _, b := range h.Checkout().Value.([]byte) {
 		counts[b]++
 	}
-	if !equal([]byte{50, 50, 50}, counts) {
+	if bytes.Compare([]byte{50, 50, 50}, counts) != 0 {
 		t.Fail()
 	}
 }
@@ -51,11 +40,18 @@ func Test1(t *testing.T) {
 func TestStaleCommit(t *testing.T) {
 	repo := New()
 	defer repo.Close()
-	h := repo.Add([]byte{})
+	h := repo.Add(1)
 	m1 := h.Checkout()
 	m2 := h.Checkout()
+	if m1.Value != 1 {
+		t.Errorf("Value should be 1: %s", m1.Value)
+	}
+	m1.Value = 2
 	if _, err := m1.Commit(); err != nil {
 		t.Errorf("Commit: %s", err)
+	}
+	if m2.Value != 1 {
+		t.Errorf("Value should be 1: %s", m2.Value)
 	}
 	if _, err := m2.Commit(); err != ErrStaleData {
 		t.Fail()
@@ -63,6 +59,10 @@ func TestStaleCommit(t *testing.T) {
 	if _, err := m2.Update(); err != nil {
 		t.Errorf("Update: %s", err)
 	}
+	if m2.Value != 2 {
+		t.Errorf("Value should be 2: %s", m2.Value)
+	}
+	m2.Value = 3
 	if _, err := m2.Commit(); err != nil {
 		t.Errorf("Commit: %s", err)
 	}
@@ -99,28 +99,28 @@ func TestWrongRepo(t *testing.T) {
 func TestLock(t *testing.T) {
 	repo := New()
 	defer repo.Close()
-	h := repo.Add([]byte{})
+	h := repo.Add(1)
 	l, err := repo.Lock()
 	if err != nil {
 		t.Errorf("Lock: %s", err)
 	}
 	m := h.Checkout()
-	m.Bytes = []byte{1}
 	if _, err := m.Commit(); err != ErrLocked {
-		t.Fail()
+		t.Errorf("Commit: %s", err)
 	}
 	m2 := h.Checkout()
-	if !equal([]byte{}, m2.Bytes) {
-		t.Fail()
+	if m2.Value != 1 {
+		t.Errorf("Value should be 1: %s", m2.Value)
 	}
+	m.Value = 2
 	if _, err := m.CommitWithLock(l); err != nil {
 		t.Errorf("CommitWithLock: %s", err)
 	}
 	if _, err := m2.Update(); err != nil {
 		t.Errorf("Update: %s", err)
 	}
-	if !equal([]byte{1}, m2.Bytes) {
-		t.Fail()
+	if m2.Value != 2 {
+		t.Errorf("Value should be 2: %s", m2.Value)
 	}
 	if err := l.Release(); err != nil {
 		t.Errorf("Release: %s", err)
@@ -128,6 +128,7 @@ func TestLock(t *testing.T) {
 	if err := l.Release(); err != ErrInvalidLock {
 		t.Fail()
 	}
+	m.Value = 3
 	if _, err := m.Commit(); err != nil {
 		t.Errorf("Commit: %s", err)
 	}

@@ -4,5 +4,4 @@ an STM implementation after version control systems such as CVS, Subversion, or
 Perforce.
 
 This STM implementation stores data as slices of bytes, which are copied out on
-reads, and copied in on commits.  Hence, low-performance.  A higher-level layer
-can be added to translate the byte slices to and from data structures.
+reads, and copied in on commits.  Hence, low-performance.
