@@ -1,7 +1,0 @@
-repostm is a low-performance software transactional memory (STM) implementation
-in Go, made primarily as a learning experience and an exploration into modeling
-an STM implementation after version control systems such as CVS, Subversion, or
-Perforce.
-
-This STM implementation stores data as slices of bytes, which are copied out on
-reads, and copied in on commits.  Hence, low-performance.
