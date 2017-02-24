@@ -97,6 +97,9 @@ var (
 	// ErrRepoClosed is returned by WaitForUnlock and WaitForCommit if the
 	// Repo is closed.
 	ErrRepoClosed = errors.New("repostm: Repo closed")
+	// ErrRetryAfterCommit should be returned by functions passed into
+	// Atomically to wait for another commit and then retry.
+	ErrRetryAfterCommit = errors.New("repostm: Retry after commit")
 )
 
 // New creates a new Repo.
@@ -342,6 +345,30 @@ func (repo *Repo) Add(value interface{}) Handle {
 	}
 }
 
+// Atomically modify and commit the memory, retrying until it succeeds.
+func (repo *Repo) Atomically(update func() error, memory ...*Memory) (RepoVersion, error) {
+	for {
+		version, err := repo.Update(memory...)
+		if err != nil {
+			return version, err
+		}
+		err = update()
+		if err == nil {
+		} else if err == ErrRetryAfterCommit {
+			version, err = repo.WaitForCommit(version)
+			if err != nil {
+				return version, err
+			}
+		} else {
+			return version, err
+		}
+		version, err = repo.Commit(memory...)
+		if err != ErrStaleData {
+			return version, err
+		}
+	}
+}
+
 // Checkout creates a new local copy of the piece of memory associated with
 // the Handle.
 func (repo *Repo) Checkout(handle Handle) *Memory {
@@ -421,18 +448,15 @@ func (memory *Memory) RepoVersion() RepoVersion {
 
 // Atomically modify and commit this piece of memory, retrying until it
 // succeeds.
-func (memory *Memory) Atomically(f func(interface{}) (interface{}, error)) error {
-	for {
+func (memory *Memory) Atomically(f func(interface{}) (interface{}, error)) (RepoVersion, error) {
+	return memory.canonical.repo.Atomically(func() error {
 		value, err := f(memory.Value)
 		if err != nil {
 			return err
 		}
 		memory.Value = value
-		_, err = memory.Commit()
-		if err != ErrStaleData {
-			return err
-		}
-	}
+		return nil
+	}, memory)
 }
 
 // Release releases the Lock on the Repo.
@@ -442,7 +466,7 @@ func (lock *Lock) Release() error {
 
 // Atomically modify and commit this piece of memory, retrying until it
 // succeeds.
-func (handle Handle) Atomically(f func(interface{}) (interface{}, error)) error {
+func (handle Handle) Atomically(f func(interface{}) (interface{}, error)) (RepoVersion, error) {
 	return handle.canonical.repo.Checkout(handle).Atomically(f)
 }
 

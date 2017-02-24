@@ -13,85 +13,109 @@ reads, and copied in on commits.  Hence, low-performance.
 Data is encoded into byte slices and decoded from byte slices using
 `encoding/gob`.
 
-# Examples
+# Example
+
+Example of a concurrent producer and consumers, where each consumer will take
+no more than 25% of the current total produced.
 
 ```go
-func Consume(repo *repostm.Repo, percentage, cap uint, totalHandle, availableHandle, allocationHandle repostm.Handle, wg *sync.WaitGroup) {
-	defer wg.Done()
-	total := totalHandle.Checkout()
-	available := availableHandle.Checkout()
-	allocation := allocationHandle.Checkout()
-	for {
-		version, err := repo.Revert(total, available, allocation)
-		if err != nil {
-			return
-		}
-		if allocation.Value.(uint) >= cap {
-			return
-		}
-		currentCap = percentage*total.Value.(uint)/100
-		if currentCap > cap {
-			currentCap = cap
-		}
-		if allocation.Value.(uint) < currentCap {
-			take := currentCap - allocation.Value.(uint)
-			if take > available.Value.(uint) {
-				take = available.Value.(uint)
-			}
-			if take > 0 {
-				available.Value = available.Value.(uint) - take
-				allocation.Value = allocation.Value.(uint) + take
-			}
-			version, err = repo.Commit(total, available, allocation)
-			if err != nil && err != repostm.ErrStaleData {
-				return
-			}
-		}
-		if _, err := repo.WaitForCommit(version); err != nil {
-			return
-		}
-	}
-}
-
-func AddTotal(repo *repostm.Repo, total, available *repostm.Memory, new uint) {
-	for {
-		if _, err := repo.Revert(total, available); err != nil {
-			panic(err)
-		}
-		total.Value = total.Value.(uint) + new
-		available.Value = available.Value.(uint) + new
-		if _, err := repo.Commit(total, available); err == nil {
-			return
-		} else if err != repostm.ErrStaleData {
-			panic(err)
-		}
-	}
-}
-
-func main() {
-	wg := &sync.WaitGroup{}
+func TestExample(t *testing.T) {
 	repo := repostm.New()
+	var wg sync.WaitGroup
+
+	allocationPercentage := 25
+	allocationCap := 100
+	consumerCount := 5
+	productionCap := 600
+
 	totalHandle := repo.Add(0)
 	availableHandle := repo.Add(0)
-
-	allocations := []*Memory{}
-	for i := 0; i < 5; i++ {
-		allocation := repo.Add(0)
-		allocations = append(allocations, allocation.Checkout())
-		wg.Add(1)
-		go Consume(repo, 25, 100, totalHandle, availableHandle, allcoation, wg)
+	allocationHandles := make([]repostm.Handle, consumerCount)
+	for i := range allocationHandles {
+		allocationHandles[i] = repo.Add(0)
 	}
+
+	consumer := func(allocationHandle repostm.Handle) {
+		defer wg.Done()
+		total := totalHandle.Checkout()
+		available := availableHandle.Checkout()
+		allocation := allocationHandle.Checkout()
+		for allocation.Value.(int) < allocationCap {
+			repo.Atomically(func() error {
+				currentCap := allocationPercentage * total.Value.(int) / 100
+				if currentCap > allocationCap {
+					currentCap = allocationCap
+				}
+				if allocation.Value.(int) >= currentCap {
+					return ErrRetryAfterCommit
+				}
+				take := currentCap - allocation.Value.(int)
+				if take > available.Value.(int) {
+					take = available.Value.(int)
+				}
+				if take > 0 {
+					available.Value = available.Value.(int) - take
+					allocation.Value = allocation.Value.(int) + take
+					return nil
+				} else if currentCap < allocationCap {
+					return ErrRetryAfterCommit
+				} else {
+					return nil
+				}
+			}, total, available, allocation)
+		}
+	}
+
+	for _, allocationHandle := range allocationHandles {
+		wg.Add(1)
+		go consumer(allocationHandle)
+	}
+
+	check := func(total, available *repostm.Memory, allocations []*repostm.Memory) {
+		repo.Update(append([]*repostm.Memory{total, available}, allocations...)...)
+		if total.Value.(int) < available.Value.(int) {
+			t.Errorf("total %d < available %d", total.Value, available.Value)
+		}
+		allocationTotal := 0
+		for i, allocation := range allocations {
+			allocationTotal += allocation.Value.(int)
+			if total.Value.(int)*allocationPercentage/100 < allocation.Value.(int) {
+				t.Errorf("%d%% of total %d < allocation[%d] %d", allocationPercentage, total.Value, i, allocation.Value)
+			}
+		}
+		if total.Value.(int) != available.Value.(int)+allocationTotal {
+			t.Errorf("total %d != available %d + allocations %d", total.Value, available.Value, allocationTotal)
+		}
+	}
+
+	producer := func() {
+		defer wg.Done()
+		total := totalHandle.Checkout()
+		available := availableHandle.Checkout()
+		allocations := make([]*repostm.Memory, len(allocationHandles))
+		for i, allocationHandle := range allocationHandles {
+			allocations[i] = allocationHandle.Checkout()
+		}
+		for total.Value.(int) < productionCap {
+			repo.Atomically(func() error {
+				total.Value = total.Value.(int) + 1
+				available.Value = available.Value.(int) + 1
+				return nil
+			}, total, available)
+			check(total, available, allocations)
+		}
+	}
+
+	wg.Add(1)
+	go producer()
+	wg.Wait()
 
 	total := totalHandle.Checkout()
 	available := availableHandle.Checkout()
-	for i := 0; i < 600; i++ {
-		AddTotal(repo, total, available, 1)
-		// check that the allocations and available add up to the total
-		// check that each allocation is no more than 25% of the total
-		// check that each allocation is no more than 100
+	allocations := make([]*repostm.Memory, len(allocationHandles))
+	for i, allocationHandle := range allocationHandles {
+		allocations[i] = allocationHandle.Checkout()
 	}
-
-	repo.Close()
-	wg.Wait()
+	check(total, available, allocations)
 }
 ```
