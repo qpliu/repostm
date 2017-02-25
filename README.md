@@ -3,6 +3,7 @@ in Go, made primarily as a learning experience and an exploration into modeling
 an STM implementation after version control systems such as CVS, Subversion, or
 Perforce.
 
+[![GoDoc](https://godoc.org/github.com/qpliu/repostm?status.svg)](https://godoc.org/github.com/qpliu/repostm)
 [![Build Status](https://travis-ci.org/qpliu/repostm.svg?branch=master)](https://travis-ci.org/qpliu/repostm)
 
 # Implementation
