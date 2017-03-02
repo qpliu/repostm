@@ -9,12 +9,12 @@ import (
 	"encoding/gob"
 	"errors"
 	"reflect"
+	"sync"
 )
 
 // Handle identifies particular piece of memory and may be shared.
 type Handle struct {
 	canonical *canonical
-	typ       reflect.Type
 }
 
 // Memory is a local copy of a particular piece of memory and must not be
@@ -25,21 +25,16 @@ type Memory struct {
 	repoVersion RepoVersion
 	bytes       []byte
 	Value       interface{}
+	flag        bool
 }
 
 // Repo is a repository of shared memory.
 type Repo struct {
-	version          RepoVersion
-	currentLock      *Lock
-	close            chan bool
-	update           chan batch
-	commit           chan batch
-	lock             chan batch
-	unlock           chan batch
-	waitForCommit    chan batch
-	waitersForCommit []batch
-	waitForUnlock    chan batch
-	waitersForUnlock []batch
+	version       RepoVersion
+	mutex         sync.Mutex
+	repoLock      *repoLock
+	waitForCommit sync.Cond
+	waitForUnlock sync.Cond
 }
 
 // RepoVersion is the version of a Repo and is updated each time anything is
@@ -57,28 +52,19 @@ type MemoryVersion struct {
 
 type canonical struct {
 	repo    *Repo
+	mutex   sync.RWMutex
 	version MemoryVersion
+	typ     reflect.Type
 	bytes   []byte
-}
-
-type batch struct {
-	memory    []*Memory
-	checkOnly []*Memory
-	revert    bool
-	lock      *Lock
-	version   RepoVersion
-	result    chan result
-}
-
-type result struct {
-	lock    *Lock
-	version RepoVersion
-	err     error
 }
 
 // Lock is returned when locking a Repo. Commits without the Lock will fail
 // until the Lock is released.
 type Lock struct {
+	repoLock *repoLock
+}
+
+type repoLock struct {
 	repo *Repo
 }
 
@@ -94,236 +80,248 @@ var (
 	// ErrStaleData is returned when committing memory that is not up to
 	// date.
 	ErrStaleData = errors.New("repostm: Stale data")
-	// ErrRepoClosed is returned by WaitForUnlock and WaitForCommit if the
-	// Repo is closed.
-	ErrRepoClosed = errors.New("repostm: Repo closed")
 	// ErrRetryAfterCommit should be returned by functions passed into
 	// Atomically to wait for another commit and then retry.
 	ErrRetryAfterCommit = errors.New("repostm: Retry after commit")
+	// ErrTypeChanged is returned if the type of Memory.Value is not
+	// the same as the type of the value used for Add.
+	ErrTypeChanged = errors.New("repostm: Type changed")
 )
 
 // New creates a new Repo.
 func New() *Repo {
-	repo := &Repo{
-		version:       RepoVersion{1},
-		currentLock:   nil,
-		close:         make(chan bool),
-		update:        make(chan batch),
-		commit:        make(chan batch),
-		lock:          make(chan batch),
-		unlock:        make(chan batch),
-		waitForCommit: make(chan batch),
-		waitForUnlock: make(chan batch),
-	}
-	go func() {
-		defer func() {
-			close(repo.close)
-			close(repo.update)
-			close(repo.commit)
-			close(repo.lock)
-			close(repo.unlock)
-			close(repo.waitForCommit)
-			close(repo.waitForUnlock)
-			for _, w := range repo.waitersForCommit {
-				w.result <- result{err: ErrRepoClosed}
-			}
-			for _, w := range repo.waitersForUnlock {
-				w.result <- result{err: ErrRepoClosed}
-			}
-		}()
-	selectLoop:
-		for {
-			select {
-			case <-repo.close:
-				return
-			case b := <-repo.update:
-				for _, m := range b.memory {
-					if m.canonical.repo != repo {
-						b.result <- result{err: ErrWrongRepo}
-						continue selectLoop
-					}
-				}
-				for _, m := range b.memory {
-					m.repoVersion = repo.version
-					if b.revert || m.version != m.canonical.version {
-						m.version = m.canonical.version
-						m.bytes = m.bytes[0:0]
-						m.bytes = append(m.bytes, m.canonical.bytes...)
-					}
-				}
-				b.result <- result{version: repo.version}
-			case b := <-repo.commit:
-				if repo.currentLock != nil && repo.currentLock != b.lock {
-					b.result <- result{err: ErrLocked}
-					continue selectLoop
-				}
-				for _, m := range b.memory {
-					if m.canonical.repo != repo {
-						b.result <- result{err: ErrWrongRepo}
-						continue selectLoop
-					}
-					if m.version != m.canonical.version {
-						b.result <- result{err: ErrStaleData}
-						continue selectLoop
-					}
-				}
-				for _, m := range b.checkOnly {
-					if m.canonical.repo != repo {
-						b.result <- result{err: ErrWrongRepo}
-						continue selectLoop
-					}
-					if m.version != m.canonical.version {
-						b.result <- result{err: ErrStaleData}
-						continue selectLoop
-					}
-				}
-				repo.version.version++
-				for _, m := range b.memory {
-					m.canonical.version.version++
-					m.canonical.bytes = m.canonical.bytes[0:0]
-					m.canonical.bytes = append(m.canonical.bytes, m.bytes...)
-					m.version = m.canonical.version
-					m.repoVersion = repo.version
-				}
-				for _, m := range b.checkOnly {
-					m.repoVersion = repo.version
-				}
-				b.result <- result{version: repo.version}
-				for _, w := range repo.waitersForCommit {
-					w.result <- result{version: repo.version}
-				}
-				repo.waitersForCommit = repo.waitersForCommit[0:0]
-			case b := <-repo.lock:
-				if repo.currentLock == nil {
-					repo.currentLock = &Lock{repo}
-					b.result <- result{lock: repo.currentLock}
-				} else {
-					b.result <- result{err: ErrLocked}
-				}
-			case b := <-repo.unlock:
-				if b.lock == repo.currentLock {
-					repo.currentLock = nil
-					b.result <- result{}
-					for _, w := range repo.waitersForUnlock {
-						w.result <- result{}
-					}
-					repo.waitersForUnlock = repo.waitersForUnlock[0:0]
-				} else {
-					b.result <- result{err: ErrInvalidLock}
-				}
-			case b := <-repo.waitForCommit:
-				if repo.version == b.version {
-					repo.waitersForCommit = append(repo.waitersForCommit, b)
-				} else {
-					b.result <- result{version: repo.version}
-				}
-			case b := <-repo.waitForUnlock:
-				if repo.currentLock != nil {
-					repo.waitersForUnlock = append(repo.waitersForUnlock, b)
-				} else {
-					b.result <- result{}
-				}
-			}
-		}
-	}()
+	repo := &Repo{}
+	repo.waitForCommit.L = &repo.mutex
+	repo.waitForUnlock.L = &repo.mutex
 	return repo
 }
 
-// Close closes the Repo, closing its channels and ending its goroutine.
-func (repo *Repo) Close() {
-	repo.close <- true
+func (repo *Repo) validate(memory []*Memory) error {
+	for _, m := range memory {
+		if m.canonical.repo != repo {
+			return ErrWrongRepo
+		}
+		if !reflect.TypeOf(m.Value).AssignableTo(m.canonical.typ) {
+			return ErrTypeChanged
+		}
+		m.flag = false
+	}
+	return nil
+}
+
+func (repo *Repo) readLock(memory []*Memory) (RepoVersion, error) {
+	if err := repo.validate(memory); err != nil {
+		return RepoVersion{}, err
+	}
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	for _, m := range memory {
+		m.canonical.mutex.RLock()
+	}
+	return repo.version, nil
+}
+
+func readUnlock(memory []*Memory) {
+	for _, m := range memory {
+		m.canonical.mutex.RUnlock()
+	}
+}
+
+func (repo *Repo) writeLock(repoLock *repoLock, memory []*Memory) error {
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	if repoLock != repo.repoLock {
+		if repoLock == nil {
+			return ErrLocked
+		} else {
+			return ErrInvalidLock
+		}
+	}
+	for _, m := range memory {
+		m.canonical.mutex.Lock()
+	}
+	return nil
+}
+
+func (repo *Repo) writeUnlock(bumpVersion bool, memory []*Memory) RepoVersion {
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	if bumpVersion {
+		repo.version.version++
+		repo.waitForCommit.Broadcast()
+	}
+	for _, m := range memory {
+		m.canonical.mutex.Unlock()
+	}
+	return repo.version
 }
 
 // Update overwrites the local copies of memory with out of date data with
 // the latest data in the Repo.  Up to date copies are not modified.
 func (repo *Repo) Update(memory ...*Memory) (RepoVersion, error) {
-	result := make(chan result)
-	versions := make([]MemoryVersion, len(memory))
-	for i, mem := range memory {
-		versions[i] = mem.version
+	repoVersion, err := repo.readLock(memory)
+	if err != nil {
+		return repoVersion, err
 	}
-	repo.update <- batch{revert: false, memory: memory, result: result}
-	res := <-result
-	if res.err == nil {
-		for i, mem := range memory {
-			if versions[i] != mem.version {
-				mem.Reset()
-			}
+	for _, m := range memory {
+		if m.version != m.canonical.version {
+			m.flag = true
+			m.version = m.canonical.version
+			m.bytes = append(m.bytes[0:0], m.canonical.bytes...)
 		}
 	}
-	return res.version, res.err
+	readUnlock(memory)
+	for _, m := range memory {
+		m.repoVersion = repoVersion
+		if m.flag {
+			m.Reset()
+		}
+	}
+	return repoVersion, nil
 }
 
 // Revert overwrites the local copies of memory with the latest data in the
 // Repo, including up to date copies.
 func (repo *Repo) Revert(memory ...*Memory) (RepoVersion, error) {
-	result := make(chan result)
-	repo.update <- batch{revert: true, memory: memory, result: result}
-	res := <-result
-	if res.err == nil {
-		for _, mem := range memory {
-			mem.Reset()
-		}
+	repoVersion, err := repo.readLock(memory)
+	if err != nil {
+		return repoVersion, err
 	}
-	return res.version, res.err
+	for _, m := range memory {
+		m.version = m.canonical.version
+		m.bytes = append(m.bytes[0:0], m.canonical.bytes...)
+	}
+	readUnlock(memory)
+	for _, m := range memory {
+		m.repoVersion = repoVersion
+		m.Reset()
+	}
+	return repoVersion, nil
 }
 
-// Commit commits the local copies of memory to the Repo.
+// Commit commits the local copies of memory to the Repo.  If the commit
+// fails due to being out of date, the local copies are updated to the
+// latest data in the Repo.
 func (repo *Repo) Commit(memory ...*Memory) (RepoVersion, error) {
-	return repo.CommitWithLock(nil, memory...)
+	return repo.commit(nil, memory)
 }
 
 // CommitWithLock commits the local copies of memory to the Repo, which is
-// locked with the Lock.
-func (repo *Repo) CommitWithLock(lock *Lock, memory ...*Memory) (RepoVersion, error) {
-	var changed []*Memory
-	var checkOnly []*Memory
-	for _, mem := range memory {
-		if mem.precommit() {
-			changed = append(changed, mem)
-		} else {
-			checkOnly = append(checkOnly, mem)
+// locked with the Lock.  If the commit fails due to being out of date, the
+// local copies are updated to the latest data in the Repo.
+func (repo *Repo) CommitWithLock(lock Lock, memory ...*Memory) (RepoVersion, error) {
+	return repo.commit(lock.repoLock, memory)
+}
+
+func (repo *Repo) commit(repoLock *repoLock, memory []*Memory) (RepoVersion, error) {
+	if err := repo.validate(memory); err != nil {
+		return RepoVersion{}, err
+	}
+	var b bytes.Buffer
+	for _, m := range memory {
+		b.Reset()
+		if err := gob.NewEncoder(&b).Encode(m.Value); err != nil {
+			panic(err)
+		}
+		newBytes := b.Bytes()
+		if bytes.Compare(newBytes, m.bytes) != 0 {
+			m.flag = true
+			m.bytes = append(m.bytes[0:0], newBytes...)
 		}
 	}
-	result := make(chan result)
-	repo.commit <- batch{lock: lock, memory: changed, checkOnly: checkOnly, result: result}
-	res := <-result
-	if res.err != nil {
-		repo.Revert(changed...)
+
+	err := repo.writeLock(repoLock, memory)
+	if err != nil {
+		version, err2 := repo.Revert(memory...)
+		if err2 != nil {
+			panic(err2)
+		}
+		return version, err
 	}
-	return res.version, res.err
+	for _, m := range memory {
+		if m.version != m.canonical.version {
+			err = ErrStaleData
+			break
+		}
+	}
+	if err == nil {
+		for _, m := range memory {
+			if m.flag {
+				m.canonical.version.version++
+				m.version = m.canonical.version
+				m.canonical.bytes = append(m.canonical.bytes[0:0], m.bytes...)
+			}
+		}
+	} else {
+		for _, m := range memory {
+			if m.flag || m.version != m.canonical.version {
+				m.flag = true
+				m.version = m.canonical.version
+				m.bytes = append(m.bytes[0:0], m.canonical.bytes...)
+			}
+		}
+
+	}
+	repoVersion := repo.writeUnlock(err == nil, memory)
+
+	if err != nil {
+		for _, m := range memory {
+			if m.flag {
+				m.Reset()
+			}
+		}
+	}
+	for _, m := range memory {
+		m.repoVersion = repoVersion
+	}
+	return repoVersion, err
+
 }
 
 // Lock locks the Repo.
-func (repo *Repo) Lock() (*Lock, error) {
-	result := make(chan result)
-	repo.lock <- batch{result: result}
-	res := <-result
-	return res.lock, res.err
+func (repo *Repo) Lock() (Lock, error) {
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	if repo.repoLock != nil {
+		return Lock{}, ErrLocked
+	}
+	repo.repoLock = &repoLock{repo}
+	return Lock{repo.repoLock}, nil
 }
 
 // Unlock unlocks the Repo.
-func (repo *Repo) Unlock(lock *Lock) error {
-	result := make(chan result)
-	repo.unlock <- batch{lock: lock, result: result}
-	return (<-result).err
+func (repo *Repo) Unlock(lock Lock) error {
+	if lock.repoLock == nil {
+		return ErrInvalidLock
+	}
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	if lock.repoLock != repo.repoLock {
+		return ErrInvalidLock
+	}
+	repo.repoLock = nil
+	repo.waitForUnlock.Broadcast()
+	return nil
 }
 
 // WaitForUnlock waits until the Repo is unlocked.
-func (repo *Repo) WaitForUnlock() error {
-	result := make(chan result)
-	repo.waitForUnlock <- batch{result: result}
-	res := <-result
-	return res.err
+func (repo *Repo) WaitForUnlock() {
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	for repo.repoLock != nil {
+		repo.waitForUnlock.Wait()
+	}
 }
 
 // WaitForCommit waits until the Repo has seen a commit since the given
 // RepoVersion.
-func (repo *Repo) WaitForCommit(version RepoVersion) (RepoVersion, error) {
-	result := make(chan result)
-	repo.waitForCommit <- batch{version: version, result: result}
-	res := <-result
-	return res.version, res.err
+func (repo *Repo) WaitForCommit(version RepoVersion) RepoVersion {
+	repo.mutex.Lock()
+	defer repo.mutex.Unlock()
+	for repo.version == version {
+		repo.waitForCommit.Wait()
+	}
+	return repo.version
 }
 
 // Add commits a new piece of memory containing the given value to the Repo.
@@ -335,50 +333,49 @@ func (repo *Repo) Add(value interface{}) Handle {
 	if err := gob.NewEncoder(&b).Encode(value); err != nil {
 		panic(err)
 	}
-	return Handle{
-		canonical: &canonical{
-			repo:    repo,
-			version: MemoryVersion{1},
-			bytes:   b.Bytes(),
-		},
-		typ: reflect.TypeOf(value),
-	}
+	return Handle{&canonical{
+		repo:  repo,
+		bytes: b.Bytes(),
+		typ:   reflect.TypeOf(value),
+	}}
 }
 
 // Atomically modify and commit the memory, retrying until it succeeds.
 func (repo *Repo) Atomically(update func() error, memory ...*Memory) (RepoVersion, error) {
+	version, err := repo.Update(memory...)
+	if err != nil {
+		return version, err
+	}
 	for {
-		version, err := repo.Update(memory...)
-		if err != nil {
-			return version, err
-		}
 		err = update()
-		if err == nil {
-		} else if err == ErrRetryAfterCommit {
-			version, err = repo.WaitForCommit(version)
+		if err == ErrRetryAfterCommit {
+			version = repo.WaitForCommit(version)
+			version, err = repo.Update(memory...)
 			if err != nil {
 				return version, err
 			}
+		} else if err != nil {
+			return version, err
 		} else {
-			return version, err
-		}
-		version, err = repo.Commit(memory...)
-		if err != ErrStaleData {
-			return version, err
+			version, err = repo.Commit(memory...)
+			if err != ErrStaleData {
+				return version, err
+			}
 		}
 	}
 }
 
 // Checkout creates a new local copy of the piece of memory associated with
 // the Handle.
-func (repo *Repo) Checkout(handle Handle) *Memory {
-	memory := &Memory{
-		canonical: handle.canonical,
-		version:   MemoryVersion{0},
-		bytes:     nil,
-		Value:     reflect.Zero(handle.typ).Interface(),
+func (repo *Repo) Checkout(handle ...Handle) []*Memory {
+	memory := make([]*Memory, len(handle))
+	for i, h := range handle {
+		memory[i] = &Memory{
+			canonical: h.canonical,
+			Value:     reflect.Zero(h.canonical.typ).Interface(),
+		}
 	}
-	if _, err := memory.Revert(); err != nil {
+	if _, err := repo.Revert(memory...); err != nil {
 		panic(err)
 	}
 	return memory
@@ -386,7 +383,7 @@ func (repo *Repo) Checkout(handle Handle) *Memory {
 
 // Handle returns the Handle referring to the piece of memory.
 func (memory *Memory) Handle() Handle {
-	return Handle{canonical: memory.canonical, typ: reflect.TypeOf(memory.Value)}
+	return Handle{memory.canonical}
 }
 
 // Update overwrites the local copy of memory with out of date data with
@@ -408,7 +405,7 @@ func (memory *Memory) Commit() (RepoVersion, error) {
 
 // CommitWithLock commits the local copy of memory to the Repo, which is
 // locked with the Lock.
-func (memory *Memory) CommitWithLock(lock *Lock) (RepoVersion, error) {
+func (memory *Memory) CommitWithLock(lock Lock) (RepoVersion, error) {
 	return memory.canonical.repo.CommitWithLock(lock, memory)
 }
 
@@ -416,23 +413,10 @@ func (memory *Memory) CommitWithLock(lock *Lock) (RepoVersion, error) {
 // or Commit.
 func (memory *Memory) Reset() {
 	value := reflect.New(reflect.TypeOf(memory.Value))
-	if err := gob.NewDecoder(bytes.NewBuffer(memory.bytes)).DecodeValue(value); err != nil {
+	if err := gob.NewDecoder(bytes.NewReader(memory.bytes)).DecodeValue(value); err != nil {
 		panic(err)
 	}
 	memory.Value = reflect.Indirect(value).Interface()
-}
-
-func (memory *Memory) precommit() bool {
-	var b bytes.Buffer
-	if err := gob.NewEncoder(&b).Encode(memory.Value); err != nil {
-		panic(err)
-	}
-	newBytes := b.Bytes()
-	if bytes.Compare(newBytes, memory.bytes) == 0 {
-		return false
-	}
-	memory.bytes = newBytes
-	return true
 }
 
 // Version returns the version of the local copy of memory.
@@ -460,18 +444,21 @@ func (memory *Memory) Atomically(f func(interface{}) (interface{}, error)) (Repo
 }
 
 // Release releases the Lock on the Repo.
-func (lock *Lock) Release() error {
-	return lock.repo.Unlock(lock)
+func (lock Lock) Release() error {
+	if lock.repoLock == nil {
+		return ErrInvalidLock
+	}
+	return lock.repoLock.repo.Unlock(lock)
 }
 
 // Atomically modify and commit this piece of memory, retrying until it
 // succeeds.
 func (handle Handle) Atomically(f func(interface{}) (interface{}, error)) (RepoVersion, error) {
-	return handle.canonical.repo.Checkout(handle).Atomically(f)
+	return handle.canonical.repo.Checkout(handle)[0].Atomically(f)
 }
 
 // Checkout creates a new local copy of the piece of memory associated with
 // the Handle.
 func (handle Handle) Checkout() *Memory {
-	return handle.canonical.repo.Checkout(handle)
+	return handle.canonical.repo.Checkout(handle)[0]
 }

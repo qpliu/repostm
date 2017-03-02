@@ -9,7 +9,6 @@ import (
 
 func Test1(t *testing.T) {
 	repo := New()
-	defer repo.Close()
 	h := repo.Add([]byte{})
 	var wg sync.WaitGroup
 	f := func(n byte, count int) {
@@ -39,28 +38,48 @@ func Test1(t *testing.T) {
 
 func TestStaleCommit(t *testing.T) {
 	repo := New()
-	defer repo.Close()
 	h := repo.Add(1)
 	m1 := h.Checkout()
 	m2 := h.Checkout()
+	if m1.Version() != m2.Version() {
+		t.Error("Version should be equal")
+	}
+	if m1.RepoVersion() != m2.RepoVersion() {
+		t.Error("RepoVersion should be equal")
+	}
 	if m1.Value != 1 {
-		t.Errorf("Value should be 1: %s", m1.Value)
+		t.Errorf("Value should be 1: %v", m1.Value)
 	}
 	m1.Value = 2
 	if _, err := m1.Commit(); err != nil {
 		t.Errorf("Commit: %s", err)
 	}
 	if m2.Value != 1 {
-		t.Errorf("Value should be 1: %s", m2.Value)
+		t.Errorf("Value should be 1: %v", m2.Value)
+	}
+	if m1.Version() == m2.Version() {
+		t.Error("Version should not be equal")
+	}
+	if m1.RepoVersion() == m2.RepoVersion() {
+		t.Error("RepoVersion should not be equal")
 	}
 	if _, err := m2.Commit(); err != ErrStaleData {
-		t.Fail()
+		t.Errorf("Should be ErrStaleData: %v", err)
+	}
+	if m2.Value != 2 {
+		t.Errorf("Value should be 2: %v", m2.Value)
+	}
+	if m1.Version() != m2.Version() {
+		t.Error("Version should be equal")
+	}
+	if m1.RepoVersion() != m2.RepoVersion() {
+		t.Error("RepoVersion should be equal")
 	}
 	if _, err := m2.Update(); err != nil {
 		t.Errorf("Update: %s", err)
 	}
 	if m2.Value != 2 {
-		t.Errorf("Value should be 2: %s", m2.Value)
+		t.Errorf("Value should be 2: %v", m2.Value)
 	}
 	m2.Value = 3
 	if _, err := m2.Commit(); err != nil {
@@ -69,11 +88,21 @@ func TestStaleCommit(t *testing.T) {
 
 }
 
+func TestTypeChanged(t *testing.T) {
+	repo := New()
+	m := repo.Add("test").Checkout()
+	if m.Value != "test" {
+		t.Errorf("Value should be test: %v", m.Value)
+	}
+	m.Value = 1
+	if _, err := m.Commit(); err != ErrTypeChanged {
+		t.Errorf("Should be ErrTypeChanged: %v", err)
+	}
+}
+
 func TestWrongRepo(t *testing.T) {
 	r1 := New()
-	defer r1.Close()
 	r2 := New()
-	defer r2.Close()
 	m1 := r1.Add([]byte{}).Checkout()
 	m2 := r2.Add([]byte{}).Checkout()
 	if _, err := r1.Update(m1); err != nil {
@@ -98,11 +127,17 @@ func TestWrongRepo(t *testing.T) {
 
 func TestLock(t *testing.T) {
 	repo := New()
-	defer repo.Close()
 	h := repo.Add(1)
 	l, err := repo.Lock()
 	if err != nil {
 		t.Errorf("Lock: %s", err)
+	}
+	if l2, err := repo.Lock(); err != ErrLocked {
+		t.Errorf("Lock: %s", err)
+	} else {
+		if err := l2.Release(); err != ErrInvalidLock {
+			t.Errorf("Release: %s", err)
+		}
 	}
 	m := h.Checkout()
 	if _, err := m.Commit(); err != ErrLocked {
@@ -110,7 +145,7 @@ func TestLock(t *testing.T) {
 	}
 	m2 := h.Checkout()
 	if m2.Value != 1 {
-		t.Errorf("Value should be 1: %s", m2.Value)
+		t.Errorf("Value should be 1: %v", m2.Value)
 	}
 	m.Value = 2
 	if _, err := m.CommitWithLock(l); err != nil {
@@ -120,7 +155,7 @@ func TestLock(t *testing.T) {
 		t.Errorf("Update: %s", err)
 	}
 	if m2.Value != 2 {
-		t.Errorf("Value should be 2: %s", m2.Value)
+		t.Errorf("Value should be 2: %v", m2.Value)
 	}
 	if err := l.Release(); err != nil {
 		t.Errorf("Release: %s", err)
@@ -137,20 +172,19 @@ func TestLock(t *testing.T) {
 func TestWaitForCommit(t *testing.T) {
 	startTime := time.Now()
 	repo := New()
-	defer repo.Close()
 	h := repo.Add([]byte{})
 	version, err := h.Checkout().Update()
+	if err != nil {
+		t.Errorf("WaitForCommit: %s", err)
+	}
 	sleepTime := 100 * time.Millisecond
 	go func() {
 		time.Sleep(sleepTime)
 		if _, err := h.Checkout().Commit(); err != nil {
-			t.Errorf("WaitForUnlock: %s", err)
+			t.Errorf("WaitForCommit: %s", err)
 		}
 	}()
-	newVersion, err := repo.WaitForCommit(version)
-	if err != nil {
-		t.Errorf("WaitForUnlock: %s", err)
-	}
+	newVersion := repo.WaitForCommit(version)
 	if newVersion == version {
 		t.Fail()
 	}
@@ -162,7 +196,6 @@ func TestWaitForCommit(t *testing.T) {
 func TestWaitForUnlock(t *testing.T) {
 	startTime := time.Now()
 	repo := New()
-	defer repo.Close()
 	l, err := repo.Lock()
 	if err != nil {
 		t.Errorf("Lock: %s", err)
@@ -172,9 +205,7 @@ func TestWaitForUnlock(t *testing.T) {
 		time.Sleep(sleepTime)
 		l.Release()
 	}()
-	if err := repo.WaitForUnlock(); err != nil {
-		t.Errorf("WaitForUnlock: %s", err)
-	}
+	repo.WaitForUnlock()
 	if startTime.Add(sleepTime).After(time.Now()) {
 		t.Fail()
 	}
