@@ -51,11 +51,12 @@ type MemoryVersion struct {
 }
 
 type canonical struct {
-	repo    *Repo
-	mutex   sync.RWMutex
-	version MemoryVersion
-	typ     reflect.Type
-	bytes   []byte
+	repo        *Repo
+	mutex       sync.RWMutex
+	writeLocked bool
+	version     MemoryVersion
+	typ         reflect.Type
+	bytes       []byte
 }
 
 // Lock is returned when locking a Repo. Commits without the Lock will fail
@@ -116,6 +117,11 @@ func (repo *Repo) readLock(memory []*Memory) (RepoVersion, error) {
 	repo.mutex.Lock()
 	defer repo.mutex.Unlock()
 	for _, m := range memory {
+		if m.canonical.writeLocked {
+			return repo.version, ErrStaleData
+		}
+	}
+	for _, m := range memory {
 		m.canonical.mutex.RLock()
 	}
 	return repo.version, nil
@@ -138,6 +144,12 @@ func (repo *Repo) writeLock(repoLock *repoLock, memory []*Memory) error {
 		}
 	}
 	for _, m := range memory {
+		if m.canonical.writeLocked {
+			return ErrStaleData
+		}
+	}
+	for _, m := range memory {
+		m.canonical.writeLocked = true
 		m.canonical.mutex.Lock()
 	}
 	return nil
@@ -151,6 +163,7 @@ func (repo *Repo) writeUnlock(bumpVersion bool, memory []*Memory) RepoVersion {
 		repo.waitForCommit.Broadcast()
 	}
 	for _, m := range memory {
+		m.canonical.writeLocked = false
 		m.canonical.mutex.Unlock()
 	}
 	return repo.version
