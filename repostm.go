@@ -30,11 +30,12 @@ type Memory struct {
 
 // Repo is a repository of shared memory.
 type Repo struct {
-	version       RepoVersion
-	mutex         sync.Mutex
-	repoLock      *repoLock
-	waitForCommit sync.Cond
-	waitForUnlock sync.Cond
+	version            RepoVersion
+	mutex              sync.Mutex
+	repoLock           *repoLock
+	waitForCommit      sync.Cond
+	waitForUnlock      sync.Cond
+	waitForWriteUnlock sync.Cond
 }
 
 // RepoVersion is the version of a Repo and is updated each time anything is
@@ -94,6 +95,7 @@ func New() *Repo {
 	repo := &Repo{}
 	repo.waitForCommit.L = &repo.mutex
 	repo.waitForUnlock.L = &repo.mutex
+	repo.waitForWriteUnlock.L = &repo.mutex
 	return repo
 }
 
@@ -116,10 +118,15 @@ func (repo *Repo) readLock(memory []*Memory) (RepoVersion, error) {
 	}
 	repo.mutex.Lock()
 	defer repo.mutex.Unlock()
-	for _, m := range memory {
-		if m.canonical.writeLocked {
-			return repo.version, ErrStaleData
+checkingForWriteLocks:
+	for {
+		for _, m := range memory {
+			if m.canonical.writeLocked {
+				repo.waitForWriteUnlock.Wait()
+				continue checkingForWriteLocks
+			}
 		}
+		break
 	}
 	for _, m := range memory {
 		m.canonical.mutex.RLock()
@@ -166,6 +173,7 @@ func (repo *Repo) writeUnlock(bumpVersion bool, memory []*Memory) RepoVersion {
 		m.canonical.writeLocked = false
 		m.canonical.mutex.Unlock()
 	}
+	repo.waitForWriteUnlock.Broadcast()
 	return repo.version
 }
 
