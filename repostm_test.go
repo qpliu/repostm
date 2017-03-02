@@ -2,6 +2,7 @@ package repostm
 
 import (
 	"bytes"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -64,7 +65,7 @@ func TestStaleCommit(t *testing.T) {
 		t.Error("RepoVersion should not be equal")
 	}
 	if _, err := m2.Commit(); err != ErrStaleData {
-		t.Errorf("Should be ErrStaleData: %v", err)
+		t.Errorf("Should be ErrStaleData: %s", err)
 	}
 	if m2.Value != 2 {
 		t.Errorf("Value should be 2: %v", m2.Value)
@@ -96,7 +97,7 @@ func TestTypeChanged(t *testing.T) {
 	}
 	m.Value = 1
 	if _, err := m.Commit(); err != ErrTypeChanged {
-		t.Errorf("Should be ErrTypeChanged: %v", err)
+		t.Errorf("Should be ErrTypeChanged: %s", err)
 	}
 }
 
@@ -109,19 +110,27 @@ func TestWrongRepo(t *testing.T) {
 		t.Errorf("Update: %s", err)
 	}
 	if _, err := r1.Update(m1, m2); err != ErrWrongRepo {
-		t.Fail()
+		t.Errorf("Update: %s", err)
 	}
 	if _, err := r1.Update(m2); err != ErrWrongRepo {
-		t.Fail()
+		t.Errorf("Update: %s", err)
 	}
 	if _, err := r1.Commit(m1); err != nil {
 		t.Errorf("Commit: %s", err)
 	}
 	if _, err := r1.Commit(m1, m2); err != ErrWrongRepo {
-		t.Fail()
+		t.Errorf("Commit: %s", err)
 	}
 	if _, err := r1.Commit(m2); err != ErrWrongRepo {
-		t.Fail()
+		t.Errorf("Commit: %s", err)
+	}
+	if _, err := r1.Revert(m1, m2); err != ErrWrongRepo {
+		t.Errorf("Revert: %s", err)
+	}
+	if _, err := r1.Atomically(func() error {
+		return nil
+	}, m1, m2); err != ErrWrongRepo {
+		t.Errorf("Atomically: %s", err)
 	}
 }
 
@@ -137,6 +146,9 @@ func TestLock(t *testing.T) {
 	} else {
 		if err := l2.Release(); err != ErrInvalidLock {
 			t.Errorf("Release: %s", err)
+		}
+		if err := repo.Unlock(l2); err != ErrInvalidLock {
+			t.Errorf("Unlock: %s", err)
 		}
 	}
 	m := h.Checkout()
@@ -164,6 +176,9 @@ func TestLock(t *testing.T) {
 		t.Fail()
 	}
 	m.Value = 3
+	if _, err := m.CommitWithLock(l); err != ErrInvalidLock {
+		t.Errorf("CommitWithLock: %s", err)
+	}
 	if _, err := m.Commit(); err != nil {
 		t.Errorf("Commit: %s", err)
 	}
@@ -208,6 +223,107 @@ func TestWaitForUnlock(t *testing.T) {
 	repo.WaitForUnlock()
 	if startTime.Add(sleepTime).After(time.Now()) {
 		t.Fail()
+	}
+}
+
+func TestAtomicallyError(t *testing.T) {
+	repo := New()
+	h := repo.Add("test")
+
+	updateErr := errors.New("TestAtomicallyError")
+	if _, err := h.Atomically(func(v interface{}) (interface{}, error) {
+		return nil, updateErr
+	}); err != updateErr {
+		t.Errorf("Atomically: %s", err)
+	}
+
+	m := h.Checkout()
+	if _, err := repo.Atomically(func() error {
+		go func() {
+			if _, err := h.Atomically(func(v interface{}) (interface{}, error) {
+				return "changed", nil
+			}); err != nil {
+				t.Errorf("Atomically: %s", err)
+			}
+		}()
+		m.Value = 1
+		return ErrRetryAfterCommit
+	}, m); err != ErrTypeChanged {
+		t.Errorf("Atomically: %s", err)
+	}
+	m.Reset()
+	if m.Value != "test" {
+		t.Errorf("Value: %v", m.Value)
+	}
+	if _, err := m.Revert(); err != nil {
+		t.Errorf("Revert: %s", err)
+	}
+	if m.Value != "changed" {
+		t.Errorf("Value: %v", m.Value)
+	}
+}
+
+func TestVersions(t *testing.T) {
+	repo := New()
+	m := repo.Checkout(repo.Add(1), repo.Add("a"))
+	repoVersion := m[0].RepoVersion()
+	if repoVersion != m[1].RepoVersion() {
+		t.Errorf("repoVersion")
+	}
+	oldVersion0 := m[0].Version()
+	oldVersion1 := m[1].Version()
+	m[1].Value = "b"
+	newRepoVersion, err := repo.Commit(m...)
+	if err != nil {
+		t.Errorf("Commit: %s", err)
+	}
+	if repoVersion == newRepoVersion {
+		t.Errorf("newRepoVersion")
+	}
+	if m[0].RepoVersion() != newRepoVersion {
+		t.Errorf("m[0].RepoVersion()")
+	}
+	if m[1].RepoVersion() != newRepoVersion {
+		t.Errorf("m[1].RepoVersion()")
+	}
+	if m[0].Value != 1 {
+		t.Errorf("m[0].Value should be 1: %v", m[0].Value)
+	}
+	if m[1].Value != "b" {
+		t.Errorf("m[1].Value should be b: %v", m[1].Value)
+	}
+	if m[0].Version() != oldVersion0 {
+		t.Errorf("oldVersion0")
+	}
+	if m[1].Version() == oldVersion1 {
+		t.Errorf("oldVersion1")
+	}
+}
+
+func TestHandle(t *testing.T) {
+	repo := New()
+	h := repo.Add(0)
+	m := h.Checkout()
+	if h != m.Handle() {
+		t.Fail()
+	}
+}
+
+func TestRevert(t *testing.T) {
+	repo := New()
+	m := repo.Add("test").Checkout()
+	if m.Value != "test" {
+		t.Errorf("m.Value should be test: %v", m.Value)
+	}
+	m.Value = "new"
+	if m.Value != "new" {
+		t.Errorf("m.Value should be new: %v", m.Value)
+	}
+	if _, err := m.Revert(); err != nil {
+		t.Errorf("Revert: %s", err)
+	}
+	if m.Value != "test" {
+		t.Errorf("m.Value should be test: %v", m.Value)
 	}
 }
 

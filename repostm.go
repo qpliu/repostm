@@ -433,7 +433,7 @@ func (memory *Memory) CommitWithLock(lock Lock) (RepoVersion, error) {
 // Reset resets local copy of the Value to its value at the last Update
 // or Commit.
 func (memory *Memory) Reset() {
-	value := reflect.New(reflect.TypeOf(memory.Value))
+	value := reflect.New(memory.canonical.typ)
 	if err := gob.NewDecoder(bytes.NewReader(memory.bytes)).DecodeValue(value); err != nil {
 		panic(err)
 	}
