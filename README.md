@@ -20,7 +20,7 @@ Example of a concurrent producer and consumers, where each consumer will take
 no more than 25% of the current total produced.
 
 ```go
-func TestExample(t *testing.T) {
+func ExampleProducerConsumers() {
 	repo := repostm.New()
 	var wg sync.WaitGroup
 
@@ -75,17 +75,17 @@ func TestExample(t *testing.T) {
 	check := func(total, available *repostm.Memory, allocations []*repostm.Memory) {
 		repo.Update(append([]*repostm.Memory{total, available}, allocations...)...)
 		if total.Value.(int) < available.Value.(int) {
-			t.Errorf("total %d < available %d", total.Value, available.Value)
+			fmt.Printf("total %d < available %d\n", total.Value, available.Value)
 		}
 		allocationTotal := 0
 		for i, allocation := range allocations {
 			allocationTotal += allocation.Value.(int)
 			if total.Value.(int)*allocationPercentage/100 < allocation.Value.(int) {
-				t.Errorf("%d%% of total %d < allocation[%d] %d", allocationPercentage, total.Value, i, allocation.Value)
+				fmt.Printf("%d%% of total %d < allocation[%d] %d\n", allocationPercentage, total.Value, i, allocation.Value)
 			}
 		}
 		if total.Value.(int) != available.Value.(int)+allocationTotal {
-			t.Errorf("total %d != available %d + allocations %d", total.Value, available.Value, allocationTotal)
+			fmt.Printf("total %d != available %d + allocations %d\n", total.Value, available.Value, allocationTotal)
 		}
 	}
 
@@ -118,5 +118,6 @@ func TestExample(t *testing.T) {
 		allocations[i] = allocationHandle.Checkout()
 	}
 	check(total, available, allocations)
+	// Output:
 }
 ```

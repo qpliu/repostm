@@ -3,6 +3,7 @@ package repostm
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -327,7 +328,7 @@ func TestRevert(t *testing.T) {
 	}
 }
 
-func TestExample(t *testing.T) {
+func ExampleProducerConsumers() {
 	repo := New()
 	var wg sync.WaitGroup
 
@@ -382,17 +383,17 @@ func TestExample(t *testing.T) {
 	check := func(total, available *Memory, allocations []*Memory) {
 		repo.Update(append([]*Memory{total, available}, allocations...)...)
 		if total.Value.(int) < available.Value.(int) {
-			t.Errorf("total %d < available %d", total.Value, available.Value)
+			fmt.Printf("total %d < available %d\n", total.Value, available.Value)
 		}
 		allocationTotal := 0
 		for i, allocation := range allocations {
 			allocationTotal += allocation.Value.(int)
 			if total.Value.(int)*allocationPercentage/100 < allocation.Value.(int) {
-				t.Errorf("%d%% of total %d < allocation[%d] %d", allocationPercentage, total.Value, i, allocation.Value)
+				fmt.Printf("%d%% of total %d < allocation[%d] %d\n", allocationPercentage, total.Value, i, allocation.Value)
 			}
 		}
 		if total.Value.(int) != available.Value.(int)+allocationTotal {
-			t.Errorf("total %d != available %d + allocations %d", total.Value, available.Value, allocationTotal)
+			fmt.Printf("total %d != available %d + allocations %d\n", total.Value, available.Value, allocationTotal)
 		}
 	}
 
@@ -425,4 +426,5 @@ func TestExample(t *testing.T) {
 		allocations[i] = allocationHandle.Checkout()
 	}
 	check(total, available, allocations)
+	// Output:
 }
